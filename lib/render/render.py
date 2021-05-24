@@ -1,13 +1,13 @@
 import numpy as np
 import matplotlib
+import datetime
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib import style
-import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from mpl_finance import candlestick_ochl as candlestick
 
-style.use('dark_background')
+style.use('classic')
 
 VOLUME_CHART_HEIGHT = 0.33
 
@@ -17,15 +17,9 @@ UP_TEXT_COLOR = '#73D3CC'
 DOWN_TEXT_COLOR = '#DC2C27'
 
 
-def bytespdate2num(fmt, encoding='utf-8'):
-    def bytesconverter(b):
-        s = b.decode(encoding)
-        return (mdates.datestr2num(s))
-    return bytesconverter
-
 def date2num(date):
-    converter = bytespdate2num('%y-%m')
-    return converter(date)
+    print(int(date[0:4]), int(date[5:]), 'DATA', date[5:])
+    return mdates.date2num(datetime.datetime(int(date[0:4]), int(date[5:]), 1))
 
 
 class StockTradingGraph:
@@ -36,17 +30,15 @@ class StockTradingGraph:
         self.net_worths = np.zeros(len(df))
 
         fig = plt.figure()
-        fig.suptitle(title)
+        fig.suptitle('Торговля на основе прогноза')
         # Create a figure on screen and set the title
 
         # Create top subplot for net worth axis
         self.net_worth_ax = plt.subplot2grid(
             (6, 1), (0, 0), rowspan=2, colspan=1)
-
         # Create bottom subplot for shared price/volume axis
         self.price_ax = plt.subplot2grid(
             (6, 1), (2, 0), rowspan=8, colspan=1, sharex=self.net_worth_ax)
-
         # Create a new axis for volume which shares its x-axis with price
         self.volume_ax = self.price_ax.twinx()
 
@@ -55,6 +47,7 @@ class StockTradingGraph:
                             right=0.90, top=0.90, wspace=0.2, hspace=0)
 
         # Show the graph without blocking the rest of the program
+
         plt.show(block=False)
 
     def _render_net_worth(self, current_step, net_worth, step_range, dates):
@@ -62,8 +55,7 @@ class StockTradingGraph:
         self.net_worth_ax.clear()
 
         # Plot net worths
-        self.net_worth_ax.plot_date(
-            dates, self.net_worths[step_range], '-', label='Net Worth')
+        self.net_worth_ax.plot_date(dates, self.net_worths[step_range], '-', label='Net Worth')
 
         # Show legend, which uses the label we defined for the plot above
         self.net_worth_ax.legend()
@@ -93,9 +85,10 @@ class StockTradingGraph:
                            self.df['open'].values[step_range], self.df['close'].values[step_range],
                            self.df['high'].values[step_range], self.df['low'].values[step_range])
 
+        # print(self.price_ax)
         # Plot price using candlestick graph from mpl_finance
-        candlestick(self.price_ax, candlesticks, width=1,
-                    colorup=UP_COLOR, colordown=DOWN_COLOR)
+        candlestick(self.price_ax, candlesticks, width=1, colorup=UP_COLOR, colordown=DOWN_COLOR)
+
 
         last_date = date2num(self.df['date'].values[current_step])
         last_close = self.df['close'].values[current_step]
@@ -113,7 +106,6 @@ class StockTradingGraph:
         ylim = self.price_ax.get_ylim()
         self.price_ax.set_ylim(ylim[0] - (ylim[1] - ylim[0])
                                * VOLUME_CHART_HEIGHT, ylim[1])
-
 
     def _render_trades(self, current_step, trades, step_range):
         for trade in trades:
@@ -150,7 +142,6 @@ class StockTradingGraph:
 
         self._render_net_worth(current_step, net_worth, step_range, dates)
         self._render_price(current_step, net_worth, dates, step_range)
-        self._render_volume(current_step, net_worth, dates, step_range)
         self._render_trades(current_step, trades, step_range)
 
         # Format the date ticks to be more easily read
@@ -161,7 +152,7 @@ class StockTradingGraph:
         plt.setp(self.net_worth_ax.get_xticklabels(), visible=False)
 
         # Necessary to view frames before they are unrendered
-        plt.pause(0.001)
+        plt.pause(0.01)
 
     def close(self):
         plt.close()

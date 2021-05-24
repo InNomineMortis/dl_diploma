@@ -3,32 +3,221 @@ import warnings
 import tkinter as tk
 from finta import TA
 from tkinter import *
-from IPython import display
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import statsmodels.api as sm
-import datetime
-import random
-from statsmodels.tsa.arima_model import ARIMA
 from stable_baselines.common.vec_env import DummyVecEnv
 from stable_baselines.common.policies import MlpPolicy
 from stable_baselines import PPO2
-import gym
-import gym_anytrading
-from gym_anytrading.envs import StocksEnv
-from gym import spaces
-import numpy as np
 import pandas as pnd
 from matplotlib import pyplot as plt
+import random
+from tkinter import messagebox
+import gym
+from gym import spaces
+from tkinter import ttk
+import numpy as np
+from lib.render.render import StockTradingGraph
 
-from gym_env.stock_trading_env import StockTradingEnv
+MAX_ACCOUNT_BALANCE = 2147483647
+MAX_NUM_SHARES = 10
+#MAX_SHARE_PRICE = 50
+MAX_STEPS = 20000
+
+MAX_OPEN_POSITIONS = 5
+# INITIAL_ACCOUNT_BALANCE = 10000
+
+LOOKBACK_WINDOW_SIZE = 20
+
+global MAX_SHARE_PRICE, INITIAL_ACCOUNT_BALANCE
+
+def ok_button_click():
+    global MAX_SHARE_PRICE
+    if len(max_share_price.get()) != 0:
+        try:
+            MAX_SHARE_PRICE = int(max_share_price.get())
+        except ValueError:
+            messagebox.showwarning('Ошибка', 'Введите целое число!')
+            return
+    else:
+        MAX_SHARE_PRICE = 5000
+
+    global INITIAL_ACCOUNT_BALANCE
+    if len(account_balance.get()) != 0:
+        try:
+            INITIAL_ACCOUNT_BALANCE = int(account_balance.get())
+        except ValueError:
+            messagebox.showwarning('Ошибка', 'Введите целое число!')
+            return
+    else:
+        INITIAL_ACCOUNT_BALANCE = 10000
+
+    global RENDER_MODE
+    if render_style.get() == render_style['values'][1]:
+        RENDER_MODE = 'file'
+    else:
+        RENDER_MODE = 'live'
+    print(RENDER_MODE)
+
+    main()
 
 
-def load_model(model, model_name):
-    model = PPO2.load(model_name)
+def factor_pairs(val):
+    return [(i, val / i) for i in range(1, int(val ** 0.5) + 1) if val % i == 0]
 
 
-if __name__ == '__main__':
-    df = pnd.read_csv('datasets/F.csv')
+class StockTradingEnv(gym.Env):
+    """A stock trading environment for OpenAI gym"""
+    metadata = {'render.modes': ['live', 'file', 'none']}
+    visualization = None
+
+    def __init__(self, df):
+        super(StockTradingEnv, self).__init__()
+        self.df = df
+        self.reward_range = (0, MAX_ACCOUNT_BALANCE)
+
+        # Actions of the format Buy x%, Sell x%, Hold, etc.
+        self.action_space = spaces.Box(
+            low=np.array([0, 0]), high=np.array([3, 1]), dtype=np.float16)
+
+        # Prices contains the OHCL values for the last five prices
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(4, LOOKBACK_WINDOW_SIZE + 2), dtype=np.float16)
+
+    def _next_observation(self):
+        frame = np.zeros((4, LOOKBACK_WINDOW_SIZE + 1))
+
+        # Get the stock data points for the last 5 days and scale to between 0-1
+        np.put(frame, [0, 3], [
+            self.df.loc[self.current_step: self.current_step + LOOKBACK_WINDOW_SIZE, 'open'].values / MAX_SHARE_PRICE,
+            self.df.loc[self.current_step: self.current_step + LOOKBACK_WINDOW_SIZE, 'high'].values / MAX_SHARE_PRICE,
+            self.df.loc[self.current_step: self.current_step + LOOKBACK_WINDOW_SIZE, 'low'].values / MAX_SHARE_PRICE,
+            self.df.loc[self.current_step: self.current_step + LOOKBACK_WINDOW_SIZE, 'close'].values / MAX_SHARE_PRICE,
+        ])
+
+        # Append additional data and scale each value to between 0-1
+        obs = np.append(frame, [
+            [self.balance / MAX_ACCOUNT_BALANCE],
+            [self.max_net_worth / MAX_ACCOUNT_BALANCE],
+            [self.shares_held / MAX_NUM_SHARES],
+            [self.cost_basis / MAX_SHARE_PRICE],
+        ], axis=1)
+
+        return obs
+
+    def _take_action(self, action):
+        current_price = random.uniform(
+            self.df.loc[self.current_step, "open"], self.df.loc[self.current_step, "close"])
+
+        action_type = action[0]
+        amount = action[1]
+
+        if action_type < 1:
+            # Buy amount % of balance in shares
+            total_possible = int(self.balance / current_price)
+            shares_bought = int(total_possible * amount)
+            prev_cost = self.cost_basis * self.shares_held
+            additional_cost = shares_bought * current_price
+
+            self.balance -= additional_cost
+            self.cost_basis = (
+                                      prev_cost + additional_cost) / (self.shares_held + shares_bought)
+            self.shares_held += shares_bought
+
+            if shares_bought > 0:
+                self.trades.append({'step': self.current_step,
+                                    'shares': shares_bought, 'total': additional_cost,
+                                    'type': "buy"})
+
+        elif action_type < 2:
+            # Sell amount % of shares held
+            shares_sold = int(self.shares_held * amount)
+            self.balance += shares_sold * current_price
+            self.shares_held -= shares_sold
+            self.total_shares_sold += shares_sold
+            self.total_sales_value += shares_sold * current_price
+
+            if shares_sold > 0:
+                self.trades.append({'step': self.current_step,
+                                    'shares': shares_sold, 'total': shares_sold * current_price,
+                                    'type': "sell"})
+
+        self.net_worth = self.balance + self.shares_held * current_price
+
+        if self.net_worth > self.max_net_worth:
+            self.max_net_worth = self.net_worth
+
+        if self.shares_held == 0:
+            self.cost_basis = 0
+
+    def step(self, action):
+        # Execute one time step within the environment
+        self._take_action(action)
+
+        self.current_step += 1
+
+        delay_modifier = (self.current_step / MAX_STEPS)
+
+        reward = self.balance * delay_modifier + self.current_step
+        done = self.net_worth <= 0 or self.current_step >= len(
+            self.df.loc[:, 'open'].values)
+
+        obs = self._next_observation()
+
+        return obs, reward, done, {}
+
+    def reset(self):
+        # Reset the state of the environment to an initial state
+        self.balance = INITIAL_ACCOUNT_BALANCE
+        self.net_worth = INITIAL_ACCOUNT_BALANCE
+        self.max_net_worth = INITIAL_ACCOUNT_BALANCE
+        self.shares_held = 0
+        self.cost_basis = 0
+        self.total_shares_sold = 0
+        self.total_sales_value = 0
+        self.current_step = 0
+        self.trades = []
+
+        return self._next_observation()
+
+    def _render_to_file(self, filename='render.txt'):
+        profit = self.net_worth - INITIAL_ACCOUNT_BALANCE
+
+        file = open(filename, 'a+')
+
+        file.write(f'Step: {self.current_step}\n')
+        file.write(f'Balance: {self.balance}\n')
+        file.write(
+            f'Shares held: {self.shares_held} (Total sold: {self.total_shares_sold})\n')
+        file.write(
+            f'Avg cost for held shares: {self.cost_basis} (Total sales value: {self.total_sales_value})\n')
+        file.write(
+            f'Net worth: {self.net_worth} (Max net worth: {self.max_net_worth})\n')
+        file.write(f'Profit: {profit}\n\n')
+
+        file.close()
+
+    def render(self, mode='live', **kwargs):
+        # Render the environment to the screen
+        if mode == 'file':
+            self._render_to_file(kwargs.get('filename', 'render.txt'))
+
+        elif mode == 'live':
+            if self.visualization == None:
+                self.visualization = StockTradingGraph(
+                    self.df, kwargs.get('title', None))
+
+            if self.current_step > LOOKBACK_WINDOW_SIZE:
+                self.visualization.render(
+                    self.current_step, self.net_worth, self.trades, window_size=LOOKBACK_WINDOW_SIZE)
+
+    def close(self):
+        if self.visualization != None:
+            self.visualization.close()
+            self.visualization = None
+
+
+def main():
+    df = pnd.read_csv('datasets/VZ.csv')
     df['date'] = pnd.to_datetime(df['date'], format='%Y-%m-%d')
     df.sort_values('date', ascending=True, inplace=True)
     df.date.dt.to_period('M')
@@ -36,7 +225,6 @@ if __name__ == '__main__':
     df = df.groupby(pnd.DatetimeIndex(df.date).to_period('M')).nth(0)
     df.drop(columns=['date'], inplace=True)
     start_date = pnd.to_datetime('2015-01')
-    print(type(start_date))
     end_date = pnd.to_datetime('2020-01')
     # CLOSE
     train_data_close = df['2000-01':'2015-01']
@@ -95,6 +283,8 @@ if __name__ == '__main__':
 
     AIC = [(3, 1, 0)]
     SARIMAX_model = [(3, 1, 0), (3, 1, 1, 12)]
+    AIC_temp = []
+    SARIMAX_model_temp = []
     # for param in pdq:
     #     for param_seasonal in seasonal_pdq:
     #         try:
@@ -119,7 +309,6 @@ if __name__ == '__main__':
     # results_close = mod_close.fit(disp=-1)
 
     # Let's fit this model
-    print(SARIMAX_model[0])
     mod_close = sm.tsa.statespace.SARIMAX(train_data_close,
                                           order=SARIMAX_model[0],
                                           seasonal_order=SARIMAX_model[1],
@@ -189,32 +378,10 @@ if __name__ == '__main__':
     # lower_series_high = pnd.Series(conf[:, 0], index=index)
     # upper_series_chigh = pnd.Series(conf[:, 1], index=index)
 
-    ax = test_data_close.plot(y='close', figsize=(20, 18))
-    bx = test_data_open.plot(y='open', figsize=(20, 18))
-    pred_close.predicted_mean.plot(ax=ax, label='Dynamic Forecast close (get_forecast)')
-    pred_open.predicted_mean.plot(ax=bx, label='Dynamic Forecast open (get_forecast)')
-    ax.fill_between(pred_close_ci.index, pred_close_ci.iloc[:, 0], pred_close_ci.iloc[:, 1], color='k', alpha=.1)
-    bx.fill_between(pred_open_ci.index, pred_open_ci.iloc[:, 0], pred_open_ci.iloc[:, 1], color='k', alpha=.1)
-    # plt.plot(fc_series_close, label='forecast_close')
-    # plt.plot(fc_series_open, label='forecast_open')
-    # plt.plot(fc_series_low, label='forecast_low')
-    # plt.plot(fc_series_high, label='forecast_high')
-    # plt.xlim(left=start_date, right=end_date)
-    # plt.ylabel('close')
-    # plt.fill_between(lower_series_close.index, lower_series_close, upper_series_close,
-    #                  color='k', alpha=.15)
-    # plt.fill_between(lower_series_low.index, lower_series_low, upper_series_low,
-    #                  color='k', alpha=.15)
-    plt.xlabel('date')
-    plt.legend()
-    plt.show()
-
-    print(len(index), len(fc_series_close))
     frame = {'date': index, 'close': fc_series_close, 'low': fc_series_low, 'open': fc_series_open,
              'high': fc_series_high}
     new_df = pnd.DataFrame(frame)
     new_df = new_df.reset_index()
-    new_df.head()
 
     new_df['SMA'] = TA.SMA(new_df, 12)
     new_df['RSI'] = TA.RSI(new_df)
@@ -226,33 +393,24 @@ if __name__ == '__main__':
 
     env = DummyVecEnv([lambda: StockTradingEnv(df=new_df)])
 
-    model = PPO2(MlpPolicy, env, verbose=1)
-    model.learn(total_timesteps=50)
+    # model = PPO2(MlpPolicy, env, verbose=1)
+    # model.learn(total_timesteps=75000)
 
-    # model.save('stock_traiding_model')
+    # model.save('stock_traiding_model_20')
 
-    # model = PPO2.load('stock_traiding_model')
+    model = PPO2.load('stock_traiding_model_20')
 
     obs = env.reset()
 
-    # obs_first = obs[np.newaxis, ...]
-    # action, _states = model.predict(obs_first)
-    # obs, rewards, done, info = env.step(action)
-    # print(obs, done)
-    # obs_second = obs[np.newaxis, ...]
-    # action, _states = model.predict(obs_second)
-    # obs, rewards, done, info = env.step(action)
-    # print(obs)
-    # print('info', info)
-
     root = tk.Tk()
+
     while True:
         #     action, _states = model.predict(obs)
         #     obs, rewards, done, info = env.step(action)
         # obs = obs[np.newaxis, ...]
         action, _states = model.predict(obs)
         obs, rewards, done, info = env.step(action)
-        env.render(mode='live')
+        env.render(mode=RENDER_MODE)
         # plt.imshow(img)
         # plt.axis("off")
 
@@ -264,10 +422,66 @@ if __name__ == '__main__':
     # canvas.pack()
     # canvas.create_image(image=img)
 
+    fig_open = plt.Figure(figsize=(20, 15), dpi=100)
+    ax_open = fig_open.add_subplot(111)
+    bar_open = FigureCanvasTkAgg(fig_open, root)
+    bar_open.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH)
+    ax = test_data_open.plot(y='open', ax=ax_open, ylim=(35, 60))
+    ax_open.set_title('Open and Close prediction')
+    pred_open.predicted_mean.plot(ax=ax, label='Dynamic Forecast open (get_forecast)')
+
+    fig_close = plt.Figure(figsize=(20, 15), dpi=100)
+    ax_close = fig_close.add_subplot(111)
+    bar_close = FigureCanvasTkAgg(fig_close, root)
+    bar_close.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH)
+    ax = test_data_close.plot(y='close', ax=ax_open)
+    ax_close.set_title('CLOSE')
+    pred_close.predicted_mean.plot(ax=ax, label='Dynamic Forecast close (get_forecast)')
+
+    # pred_close.predicted_mean.plot(ax=ax, label='Dynamic Forecast close (get_forecast)')
+    # bx = test_data_close.plot(y='close', figsize=(20, 18))
+    # ax.fill_between(pred_close_ci.index, pred_close_ci.iloc[:, 0], pred_close_ci.iloc[:, 1], color='k', alpha=.1)
+    # bx.fill_between(pred_open_ci.index, pred_open_ci.iloc[:, 0], pred_open_ci.iloc[:, 1], color='k', alpha=.1)
+    #
     # figure1 = plt.figure(figsize=(20, 10))
     # ax1 = figure1.add_subplot(111)
     # bar1 = FigureCanvasTkAgg(figure1, root)
     # bar1.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH)
-
-
+    # plt.show(block=False)
     mainloop()
+
+
+def exit_app():
+    window.destroy()
+
+
+if __name__ == '__main__':
+    window = tk.Tk()
+    window.title("Долгосрочное планирование активов")
+    window.geometry("640x480")
+
+    max_share_price_label = tk.Label(text="Ограничение суммы покупки")
+    max_share_price_label.grid(row=1, column=1, padx=60, pady=30)
+    account_balance_label = tk.Label(text="Баланс аккаунта")
+    account_balance_label.grid(row=2, column=1, padx=60, pady=30)
+
+    max_share_price = tk.Entry()
+    max_share_price.grid(row=1, column=3, padx=20, pady=30)
+    account_balance = tk.Entry()
+    account_balance.grid(row=2, column=3, padx=20, pady=30)
+
+    account_balance_label = tk.Label(text="Стиль представления данных")
+    account_balance_label.grid(row=3, column=1, padx=60, pady=30)
+    render_style = ttk.Combobox()
+    render_style['values'] = ('В реальном времени', 'Вывод в файл')
+    render_style.current(1)
+    render_style.grid(row=3, column=3, padx=20, pady=30)
+
+    button = tk.Button(window, text='Задать значения', command=ok_button_click)
+
+    button.place(x=150, y=400)
+
+    exit_button = tk.Button(window, text='Выйти из программы', command=exit_app)
+
+    exit_button.place(x=330, y=400)
+    window.mainloop()
